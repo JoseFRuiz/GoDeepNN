@@ -26,16 +26,32 @@ Instead of "how likely is this image to be a cat?", it answers "how likely is ea
 
 ### The board as an image
 
-A Tic-Tac-Toe board is a 3×3 grid. You can encode it as a small "image" with two channels:
+A Tic-Tac-Toe board is a 3×3 grid. Yes, the game uses X's and O's on a single shared board — but we deliberately encode it as **two separate binary grids** rather than one grid with three values (+1/0/−1). Here is why.
+
+The same neural network will play as both X and O at different times. If we used a single channel, the network would need to learn "I am +1 when playing as X, but I am −1 when playing as O." Instead, we always encode the board from the **current player's point of view**: channel 1 is always "my pieces" and channel 2 is always "the opponent's pieces", regardless of which symbol you happen to be. The network then learns one consistent rule.
+
+**Example** — it is X's turn on this board:
 
 ```
-Channel 1 (my pieces):        Channel 2 (opponent pieces):
-  0  0  0                        0  1  0
-  0  1  0                        0  0  0
-  1  0  0                        0  0  1
+X | O | .
+---------
+. | X | .
+---------
+X | . | O
 ```
 
-This is exactly how AlphaGo encodes the Go board (48 such channels for more detail). From here, every component follows naturally.
+```
+Channel 1 (my pieces = X):    Channel 2 (opponent pieces = O):
+  1   0   0                     0   1   0
+  0   1   0                     0   0   0
+  1   0   0                     0   0   1
+
+Empty cells are simply 0 in both channels.
+```
+
+If it were O's turn on the same board, the channels would swap: O's stones go into channel 1, X's stones into channel 2. The network always sees the world the same way: "here is where I am, here is where my opponent is."
+
+This is exactly how AlphaGo encodes the Go board, using 48 such binary channels — one for "my stones", one for "opponent stones", others for "stones placed 1 turn ago", "stones placed 2 turns ago", "which groups are in danger of capture", etc. Each channel is a binary map answering one specific yes/no question about the board. From here, every component follows naturally.
 
 ---
 
