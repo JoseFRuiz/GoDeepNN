@@ -50,7 +50,182 @@ Unlike a square grid, each Hex cell has up to 6 neighbours (not 4):
 
 ### 3.3 Win detection with Union-Find
 
-Checking connectivity after every move is efficient with a Union-Find (disjoint-set) structure. We add two **virtual nodes**: one connected to all top-row cells and one connected to all bottom-row cells. Player 1 wins when those two virtual nodes are in the same component.
+#### The problem
+
+RED wins by connecting the top row to the bottom row. After every move we need to answer: "is there a continuous path of RED stones from any cell in row 0 to any cell in row N−1?" Scanning the whole board each time would be slow. Union-Find makes it nearly instant.
+
+#### What is Union-Find?
+
+Union-Find (also called disjoint-set) tracks which elements belong to the same group. It supports two operations:
+
+- **`find(x)`** — returns the "representative" (root) of the group that `x` belongs to.
+- **`union(x, y)`** — merges the groups containing `x` and `y` into one.
+
+Two elements are **connected** if `find(x) == find(y)` — they share the same root.
+
+#### How every cell becomes a node
+
+On a 3×3 Hex board, each cell gets an integer index. We also add **4 virtual nodes** that don't correspond to any cell — they serve as anchors for the board edges:
+
+```
+Board cells → indices:              Virtual nodes:
+
+  (0,0) (0,1) (0,2)                  idx 9  = RED_TOP
+   (1,0) (1,1) (1,2)                 idx 10 = RED_BOTTOM
+    (2,0) (2,1) (2,2)                idx 11 = BLUE_LEFT
+                                      idx 12 = BLUE_RIGHT
+  idx = row × 3 + col
+  (0,0)=0  (0,1)=1  (0,2)=2
+  (1,0)=3  (1,1)=4  (1,2)=5
+  (2,0)=6  (2,1)=7  (2,2)=8
+```
+
+Total nodes in the Union-Find: **N×N + 4** = 9 + 4 = 13 for a 3×3 board.
+
+#### What the virtual nodes represent
+
+```
+              RED_TOP (virtual node 9)
+             ╱    |    ╲
+           (0,0) (0,1) (0,2)     ← entire top row
+            ...  board  ...
+           (2,0) (2,1) (2,2)     ← entire bottom row
+             ╲    |    ╱
+            RED_BOTTOM (virtual node 10)
+```
+
+- **RED_TOP** is pre-connected to every top-row cell that RED occupies.
+- **RED_BOTTOM** is pre-connected to every bottom-row cell that RED occupies.
+
+Similarly, **BLUE_LEFT** connects to left-column BLUE cells, and **BLUE_RIGHT** connects to right-column BLUE cells.
+
+**Win condition:** RED wins when `find(RED_TOP) == find(RED_BOTTOM)` — meaning there is a chain of unions linking the top virtual node all the way to the bottom virtual node through RED's stones.
+
+#### Step-by-step example
+
+RED wants to connect top to bottom on this 3×3 board. Let's trace 5 moves:
+
+**Move 1 — RED plays (0,1)** (top row)
+
+```
+  .  R  .
+   .  .  .
+    .  .  .
+```
+
+Cell (0,1) is in row 0 → union it with RED_TOP.
+
+```
+Groups: {RED_TOP, (0,1)}   {RED_BOTTOM}   (everything else alone)
+```
+
+`find(RED_TOP) = find(RED_BOTTOM)`? **No** → game continues.
+
+---
+
+**Move 2 — BLUE plays (0,0)** (top-left corner)
+
+```
+  B  R  .
+   .  .  .
+    .  .  .
+```
+
+Cell (0,0) is in column 0 → union it with BLUE_LEFT.
+
+```
+RED groups:  {RED_TOP, (0,1)}   {RED_BOTTOM}
+BLUE groups: {BLUE_LEFT, (0,0)} {BLUE_RIGHT}
+```
+
+---
+
+**Move 3 — RED plays (1,1)** (center)
+
+```
+  B  R  .
+   .  R  .
+    .  .  .
+```
+
+Check all 6 neighbours of (1,1) for RED stones:
+- (0,1) = RED! → `union((1,1), (0,1))`
+
+Cell (1,1) is not in row 0 or row 2, so no virtual connection.
+
+```
+RED groups:  {RED_TOP, (0,1), (1,1)}   {RED_BOTTOM}
+```
+
+Now RED_TOP, (0,1) and (1,1) are all in the same group — the chain is growing downward.
+
+`find(RED_TOP) == find(RED_BOTTOM)`? **No** → game continues.
+
+---
+
+**Move 4 — BLUE plays (1,0)**
+
+```
+  B  R  .
+   B  R  .
+    .  .  .
+```
+
+Neighbour (0,0) = BLUE → `union((1,0), (0,0))`. Column 0 → also `union((1,0), BLUE_LEFT)`.
+
+```
+BLUE groups: {BLUE_LEFT, (0,0), (1,0)}  {BLUE_RIGHT}
+```
+
+---
+
+**Move 5 — RED plays (2,0)** (bottom row)
+
+```
+  B  R  .
+   B  R  .
+    R  .  .
+```
+
+Check neighbours of (2,0) for RED stones:
+- (1,1) = RED? No, (1,1) is a neighbour of (2,0)? Let's check the 6 neighbours of (2,0):
+  `(-1,0)→(1,0)=BLUE`, `(-1,+1)→(1,1)=RED!`, `(0,-1)→(2,-1)=out`, `(0,+1)→(2,1)=empty`, `(+1,-1)=out`, `(+1,0)=out`
+- (1,1) = RED → `union((2,0), (1,1))`
+
+Cell (2,0) is in row 2 (bottom) → `union((2,0), RED_BOTTOM)`.
+
+```
+RED groups:  {RED_TOP, (0,1), (1,1), (2,0), RED_BOTTOM}
+```
+
+`find(RED_TOP) == find(RED_BOTTOM)`? **YES** → RED wins!
+
+The chain: `RED_TOP ── (0,1) ── (1,1) ── (2,0) ── RED_BOTTOM`
+
+```
+  B  R  .         The path through the board:
+   B  R  .              R
+    R  .  .             R
+                       R
+```
+
+#### Why virtual nodes are the key trick
+
+Without virtual nodes, you would need to check: "does *any* cell in row 0 connect to *any* cell in row N−1?" That means checking N² pairs. With virtual nodes, it's a single call: `find(RED_TOP) == find(RED_BOTTOM)`. All top-row connections funnel into one representative, all bottom-row connections funnel into another. Win detection is **O(1)** after each move (amortized via path compression).
+
+#### Summary of all nodes in the Union-Find
+
+| Node | Index | Meaning |
+|---|---|---|
+| (r, c) | `r × N + c` | A cell on the board. Only participates in unions for the colour of the stone placed there. |
+| RED_TOP | `N² + 0` | Virtual anchor. Unioned with every top-row cell when RED places a stone there. |
+| RED_BOTTOM | `N² + 1` | Virtual anchor. Unioned with every bottom-row cell when RED places a stone there. |
+| BLUE_LEFT | `N² + 2` | Virtual anchor. Unioned with every left-column cell when BLUE places a stone there. |
+| BLUE_RIGHT | `N² + 3` | Virtual anchor. Unioned with every right-column cell when BLUE places a stone there. |
+
+The connections (union operations) happen in two cases:
+1. **Stone-to-stone:** when you place a stone, union it with every neighbouring cell that has the same colour.
+2. **Stone-to-virtual:** when you place a stone on a border row/column, union it with the corresponding virtual node for your colour.
 
 ```python
 # hex_env.py
@@ -327,17 +502,215 @@ Training them jointly forces the trunk to learn features useful for *both* tasks
 
 ## 5. Monte Carlo Tree Search
 
-MCTS maintains a tree of game states. Each node stores:
-- `N(s, a)` — visit count for action `a` from state `s`
-- `W(s, a)` — total value accumulated
-- `Q(s, a) = W/N` — mean value (our best estimate of how good the move is)
-- `P(s, a)` — prior probability from the policy network
+### 5.1 What is a node? What is a connection?
 
-The **PUCT formula** balances exploitation (high Q) with exploration (high prior P, low visit count N):
+The MCTS tree is a **game tree** — it mirrors the game itself. Every concept maps directly to something on the board:
+
+| Tree concept | Game meaning |
+|---|---|
+| **Node** | A specific board position (all stones placed so far + whose turn it is) |
+| **Edge** (connection) | A single move that transforms one board position into the next |
+| **Root node** | The current real board position — "where am I right now?" |
+| **Child node** | A board position one move in the future |
+| **Leaf node** | A position we have not yet explored further |
+| **Depth** | How many moves ahead we are looking |
+
+A node is **not** a neuron. It is a snapshot of the board. An edge is **not** a weight. It is one stone being placed. The tree grows as MCTS explores more possible futures.
+
+### 5.2 What each node stores
+
+Every node in the tree keeps four numbers:
 
 ```
-U(s,a) = Q(s,a) + c_puct * P(s,a) * sqrt(sum_b N(s,b)) / (1 + N(s,a))
+MCTSNode:
+  prior   P = 0.35     ← policy network's initial guess ("this move looks promising")
+  visit_n N = 12       ← how many times we've explored through this node
+  value_w W = +4.2     ← total accumulated value across all visits
+  children = {(r,c): MCTSNode, ...}   ← one child per legal follow-up move
 ```
+
+From these we compute:
+- **Q = W / N = +0.35** — the average outcome when we play through this node. Positive = looks good for the player who moved here.
+
+### 5.3 Concrete walkthrough on a 3×3 Hex board
+
+Let us walk through MCTS on a tiny 3×3 board so every node fits in a diagram. RED moves first.
+
+```
+Empty board:         RED wins top→bottom
+  . . .              BLUE wins left→right
+   . . .
+    . . .
+```
+
+The board has 9 empty cells, so the root node will have **9 children** — one for each legal first move.
+
+---
+
+#### Step A — Create the root and expand it
+
+We feed the empty board into the neural network. It returns:
+
+- **Policy** (9 probabilities): the network's prior belief about which first move is best.
+- **Value**: not used for the root, only for leaf nodes.
+
+Suppose the policy network returns these priors (higher = network thinks this move is better):
+
+```
+Policy priors for empty board:
+  0.08  0.10  0.07
+   0.12  0.25  0.11
+    0.06  0.13  0.08
+```
+
+We create 9 child nodes, one per cell, each storing its prior:
+
+```
+                        ROOT  (empty board, RED's turn)
+                       /  |  \   ...  \
+                      /   |   \        \
+                 (0,0)  (0,1)  (0,2) ... (2,2)
+                 P=0.08 P=0.10 P=0.07   P=0.08
+                 N=0    N=0    N=0       N=0
+                 W=0    W=0    W=0       W=0
+```
+
+Every child is a **leaf** (no children of its own yet). No simulations have run, so all visit counts are 0.
+
+---
+
+#### Step B — Simulation 1: Select → Expand → Evaluate → Backup
+
+**SELECT:** At the root, we pick the child with the highest PUCT score:
+
+```
+U(s,a) = Q(s,a) + c_puct × P(s,a) × √(total_visits) / (1 + N(s,a))
+```
+
+Since all N = 0 and Q = 0, the formula simplifies to just `c_puct × P(s,a) × √0 / 1`. That is zero for all children. When tied, the child with the highest prior wins → **(1,1) with P = 0.25**. This corresponds to RED playing in the center cell.
+
+The board after this move:
+
+```
+  .  .  .
+   .  R  .
+    .  .  .
+```
+
+**EXPAND:** Node (1,1) is a leaf, so we run the neural network on this new board state (from BLUE's perspective). The network returns:
+
+- **Policy priors** for BLUE's 8 remaining legal moves
+- **Value = −0.15** (meaning BLUE thinks RED is slightly ahead)
+
+We create 8 child nodes under (1,1):
+
+```
+                        ROOT
+                       / | \  ...
+                      /  |  \
+                   (0,0) (1,1)  ...
+                         P=0.25
+                         N=0, W=0
+                       / | \  ...  \
+                    (0,0)(0,1)(0,2)  (2,2)    ← BLUE's responses
+                    P=.. P=.. P=..   P=..
+```
+
+**EVALUATE:** The value network said −0.15 from BLUE's perspective. But node (1,1) belongs to RED. We need to negate: **value = +0.15** from RED's perspective.
+
+**BACKUP:** Walk back up the path, updating each node and **negating at each step**:
+
+```
+Node (1,1):  N: 0→1,  W: 0→+0.15,  Q = +0.15
+     ↑ negate
+ROOT:        N: 0→1,  W: 0→−0.15,  Q = −0.15
+```
+
+Why negate at the root? The root is RED's decision point. A value of −0.15 at the root means "after RED plays (1,1), the value to the *next* player to move at root level is −0.15." This bookkeeping ensures every Q value is always from the perspective of the player who *makes* the choice at that node.
+
+---
+
+#### Step C — Simulation 2
+
+**SELECT at ROOT:** Now the nodes have different stats. Let us compute PUCT for two children:
+
+```
+Node (1,1): Q=+0.15, N=1, P=0.25
+  U = 0.15 + 1.5 × 0.25 × √1 / (1+1) = 0.15 + 0.1875 = 0.3375
+
+Node (1,0): Q=0, N=0, P=0.12
+  U = 0 + 1.5 × 0.12 × √1 / (1+0) = 0.18
+```
+
+(1,1) still wins — it has both a good prior and a positive Q from simulation 1.
+
+Suppose we descend into (1,1) again. Now we must choose among its 8 children (BLUE's responses). They are all unvisited, so the highest-prior child wins — say (0,1) with the highest prior.
+
+**EXPAND** (0,1) under node (1,1): run the network on the board `R at center, B at (0,1)`. It returns policy priors for RED's 7 remaining moves and a value.
+
+**BACKUP** up the path: (0,1) → (1,1) → ROOT, negating at each step.
+
+---
+
+#### After many simulations the tree looks like this:
+
+```
+                          ROOT  (N=200)
+                 ╱    ╱    │    ╲    ╲
+              (0,0) (0,1) (1,1) (1,2) (2,1)  ...
+              N=8   N=12  N=95  N=35  N=28   ...
+              Q=-.1 Q=+.0 Q=+.3 Q=+.1 Q=+.2 ...
+                           │
+                    ╱  ╱   │   ╲  ╲
+                 (0,0)(0,1)(0,2)(2,0)(2,2) ...     ← BLUE responses
+                 N=5  N=22 N=18 N=30 N=15  ...
+                           │
+                    ╱  ╱   │   ╲
+                 (0,0)(1,0)(2,0)(2,2) ...           ← RED responses
+                 N=3  N=7  N=4  N=2  ...
+```
+
+Notice how the tree is **asymmetric**: branches with high Q and high prior get explored far more than others. Node (1,1) attracted 95 of 200 simulations because the policy network rated it highly and early visits confirmed it looked promising.
+
+### 5.4 Picking the final move
+
+After all simulations, AlphaGo picks the move with the **most visits**, not the highest Q:
+
+```
+Visit counts at root children:
+  8   12   7
+   28  95  35
+    15  28  12
+
+Best: (1,1) with 95 visits  → RED plays center
+```
+
+Why visits and not Q? Visit counts are more robust. A node with Q = +0.9 and N = 2 might have been lucky. A node with Q = +0.3 and N = 95 has been tested many times and consistently looked good. Visit count is a more stable measure of the tree's consensus.
+
+### 5.5 Key intuition: why this works
+
+Without neural networks, MCTS would explore every child equally — it would need millions of simulations to find good moves. The networks make it practical:
+
+| Component | Role in the tree |
+|---|---|
+| **Policy network** | Sets the **priors** on new nodes. High-prior children get explored first. This focuses the search on the 5–10 most promising moves out of 100+, cutting the effective branching factor dramatically. |
+| **Value network** | **Evaluates leaf nodes** without playing the game to completion. Instead of simulating 50 more random moves to find out if a position is good, one forward pass gives an estimate. |
+| **PUCT formula** | Balances "exploit what looks good" (Q term) with "try under-explored moves that the policy liked" (P/N term). Over time, bad moves get low Q and stop being selected; good moves accumulate visits. |
+
+### 5.6 The PUCT formula in detail
+
+```
+U(s,a) = Q(s,a) + c_puct × P(s,a) × √(Σ_b N(s,b)) / (1 + N(s,a))
+         ───┬──   ─────────────────────────┬─────────────────────────
+         exploit                        explore
+```
+
+- **Q(s,a):** average value from past visits. High Q = "every time we tried this, it led to good outcomes."
+- **P(s,a):** policy prior. High P = "the neural network thinks this move is promising, even before we simulate it."
+- **√(Σ N) / (1 + N(s,a)):** this shrinks as N(s,a) grows. A move visited 0 times gets a huge exploration bonus; a move visited 100 times gets almost none. This prevents the search from getting stuck on one branch forever.
+- **c_puct:** a constant (typically 1.0–2.0) that controls how exploratory the search is. Higher = try more different moves. Lower = focus harder on the current best.
+
+---
 
 ```python
 # mcts.py
