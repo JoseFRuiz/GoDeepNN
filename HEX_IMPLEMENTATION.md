@@ -1,6 +1,6 @@
 # Implementing and Training a Neural Network to Play Hex in PyTorch
 
-This guide walks through a complete implementation: the Hex game environment, the neural network (policy + value heads sharing a residual trunk), Monte Carlo Tree Search, self-play data generation, and the training loop. Every code block is meant to be runnable.
+This guide walks through a complete implementation: the Hex game environment, the neural network (policy + value heads sharing a residual trunk), Monte Carlo Tree Search, self-play data generation, and the training process. Every code block is meant to be runnable.
 
 ---
 
@@ -187,9 +187,8 @@ BLUE groups: {BLUE_LEFT, (0,0), (1,0)}  {BLUE_RIGHT}
     R  .  .
 ```
 
-Check neighbours of (2,0) for RED stones:
-- (1,1) = RED? No, (1,1) is a neighbour of (2,0)? Let's check the 6 neighbours of (2,0):
-  `(-1,0)→(1,0)=BLUE`, `(-1,+1)→(1,1)=RED!`, `(0,-1)→(2,-1)=out`, `(0,+1)→(2,1)=empty`, `(+1,-1)=out`, `(+1,0)=out`
+Check the 6 neighbours of (2,0) for RED stones:
+`(-1,0)→(1,0)=BLUE`, `(-1,+1)→(1,1)=RED!`, `(0,-1)→(2,-1)=out`, `(0,+1)→(2,1)=empty`, `(+1,-1)=out`, `(+1,0)=out`
 - (1,1) = RED → `union((2,0), (1,1))`
 
 Cell (2,0) is in row 2 (bottom) → `union((2,0), RED_BOTTOM)`.
@@ -396,6 +395,26 @@ class HexGame:
             print(' ' * r + ' '.join(symbols[int(c)] for c in self.board[r]))
 ```
 
+### 3.4 `make_move`, line by line
+
+The hand-traced example above showed the *idea*. Here's how each line of `make_move` (lines 326–356) actually carries it out:
+
+1. **`assert self.board[r, c] == EMPTY` / `assert self.winner is None`** — refuses to overwrite an occupied cell or to accept a move after the game has already been decided. These are sanity checks, not game logic — MCTS and self-play only ever call `make_move` with legal moves, so in normal use they never fire.
+
+2. **`self.board[r, c] = player`** — the actual state mutation. Everything from here on is bookkeeping *about* that one new stone.
+
+3. **The neighbour loop** (`for dr, dc in self.NEIGHBOURS: ...`) — checks all 6 Hex-adjacent cells around `(r, c)`. For each neighbour that's on the board *and* already holds the same color, it calls `self._uf.union((r,c), (nr,nc))`. This is exactly "Move 3" and "Move 5" in the walkthrough above, where placing a stone next to an existing same-color stone merged their groups (e.g. `union((1,1), (0,1))`).
+
+4. **`self._connect_virtuals(r, c, player)`** — checks whether `(r, c)` sits on *that player's* target edge (row 0 / row N−1 for RED, column 0 / column N−1 for BLUE) and, if so, unions it with the corresponding virtual anchor node. This is "Move 1" and "Move 4" in the walkthrough — the moment a border stone gets wired into `RED_TOP`, `RED_BOTTOM`, `BLUE_LEFT`, or `BLUE_RIGHT`.
+
+5. **The win check** (`self._uf.connected(self._virtual(player, 0), self._virtual(player, 1))`) — after the two unions above have possibly extended the player's group, this asks: "are that player's two virtual anchors now in the same Union-Find group?" This is the single `find(RED_TOP) == find(RED_BOTTOM)` comparison from "Move 5" in the walkthrough, generalized to work for either player. If true, `self.winner` is set and `reward = 1.0`; otherwise the game continues with `reward = 0.0`.
+
+6. **`self.current = BLUE if player == RED else RED`** — turn passes to the other player regardless of whether this move won the game (the caller checks `done` to decide whether to keep playing).
+
+7. **`return reward, done`** — handed back to whoever called `make_move` (self-play loop, MCTS simulation, or the human-vs-AI loop) so they know whether to keep going.
+
+Note that steps 3–5 only ever touch the stones and virtual nodes belonging to `player` — the mover's own color. That's why a single stone placement is enough to trigger an O(1) win check: the Union-Find structure only ever needs to answer "is *this* player now fully connected," never anything about the opponent's shape.
+
 ---
 
 ## 4. The Neural Network
@@ -420,6 +439,46 @@ Policy     Value
    │         │
 P(move)    V(s) ∈ [-1,+1]
 ```
+
+### 4.1 Input and output, precisely
+
+**Input** — a `(batch, 2, N, N)` tensor, produced by `HexGame.encode()` ([hex_env.py:361–371](HEX_IMPLEMENTATION.md#L361)):
+
+| Channel | Content |
+|---|---|
+| 0 | 1.0 at every cell occupied by the **current player to move**, 0.0 elsewhere |
+| 1 | 1.0 at every cell occupied by the **opponent**, 0.0 elsewhere |
+
+This is a *perspective-relative* encoding, not a fixed RED/BLUE encoding — after RED moves and it becomes BLUE's turn, channel 0 now means "BLUE's stones." That's deliberate: it lets one network play both colors, since from the mover's point of view "my stones vs. their stones" looks the same regardless of which physical color they are.
+
+**Output** — the network returns a tuple `(policy_logits, value)`:
+
+| | Shape | Meaning |
+|---|---|---|
+| `policy_logits` | `(batch, N²)` | One raw score per board cell, flattened row-major (cell `(r,c)` → index `r*N+c`). This is a **preference ranking over which cell to play *next*, this turn** — not a plan, not a sequence of future moves, just "given the board right now, how promising does each empty cell look as the *immediate* move." It's not yet a probability distribution: the relative order and magnitude of the scores is meaningful, but no softmax is applied inside `forward()`. The caller applies softmax *after* masking out illegal (occupied) cells, as done in `MCTS._evaluate` ([mcts.py:782–785](HEX_IMPLEMENTATION.md#L782)). |
+| `value` | `(batch, 1)` | A single scalar in `[-1, +1]` via `tanh`, estimating the outcome **for the current player to move** — +1 means "this player is expected to win," −1 means "expected to lose." Because the input is perspective-relative, this value is always interpreted the same way regardless of which color is actually moving. |
+
+Concretely, for the empty 3×3 board in [Section 5.3](#53-concrete-walkthrough-on-a-33-hex-board), the network's raw `policy_logits` are 9 numbers (one per cell) — after masking (nothing to mask on an empty board) and softmax, they become the priors shown there:
+
+```
+0.08  0.10  0.07
+ 0.12  0.25  0.11
+  0.06  0.13  0.08
+```
+
+Cell `(1,1)` (the center) has the highest score, 0.25 — the network's single strongest opinion about which cell to play *this move*. It says nothing about what happens two or three moves later; that longer-horizon reasoning is exactly what MCTS's tree search builds on top of these one-ply preferences.
+
+So the network never sees "RED" or "BLUE" directly, and never outputs a move — it outputs a preference ranking over all N² cells for the immediate next move (policy) and a scalar confidence in the current mover's chances (value). Turning the policy logits into an actual move, and turning the value into a search signal, is MCTS's job ([Section 5](#5-monte-carlo-tree-search)), not the network's.
+
+#### Why one value, not one per color
+
+It's tempting to expect two numbers out — "how good for RED" and "how good for BLUE" — but in a two-player zero-sum game those aren't independent quantities. If RED has an 80% chance to win, BLUE has exactly a 20% chance; one value is always the negation of the other (`V_opponent = -V_mover`), so storing both would just mean storing `x` and `-x`.
+
+Concretely: take one fixed arrangement of stones on the board. Feed it in with RED to move — the encoding puts RED's stones in channel 0, BLUE's in channel 1, and the network might output `value = +0.8` ("the mover, RED, is likely winning"). Now feed in the *same stones* but with BLUE to move instead — channels 0 and 1 swap (BLUE is now "current player"), and the network outputs `value = -0.8` ("the mover, BLUE, is likely losing"). Same stones, opposite output, because the input itself flipped along with whose turn it is. The "BLUE value" was never missing information — it's just the negation of the "RED value," recoverable for free by swapping which color is in channel 0.
+
+This is the same trick as the **negamax** backup used throughout MCTS's search ([Section 5.3](#53-concrete-walkthrough-on-a-33-hex-board)): `value = -value` at every level up the tree, because each level up is the other player's perspective. The network's single perspective-relative scalar and the tree's negation-on-backup are the same idea applied in two places, and both exist so one network/one tree can represent both players without duplicating state.
+
+---
 
 ```python
 # hex_net.py
@@ -494,9 +553,57 @@ class HexNet(nn.Module):
         return p, v
 ```
 
-### Why two heads on one network?
+### 4.2 Why two heads on one network?
 
-Training them jointly forces the trunk to learn features useful for *both* tasks. A feature like "I have a chain of stones almost connecting my sides" is both evidence that I am likely to win (value) *and* a reason to extend that chain (policy). Sharing the trunk means that signal is computed once and used twice.
+#### The mechanical reason: two loss terms, one set of trunk weights
+
+Look at the loss in [Section 7](#7-training): `L = L_policy + L_value`. Both terms are summed into a single scalar *before* `loss.backward()` is called, so during backpropagation the trunk's convolutional filters receive **two gradient signals added together** — one pulling the features toward "what predicts the MCTS visit distribution" and one pulling them toward "what predicts the game outcome." The policy head and value head each have their own private layers (`policy_conv`/`policy_fc` vs. `value_conv`/`value_fc1`/`value_fc2`) that receive only their own gradient, but the shared `stem` and `tower` are shaped by both. This is standard **multi-task learning**: the trunk is optimized for the intersection of what both tasks need, not either one alone.
+
+#### Concrete shared features on a Hex board
+
+Training them jointly forces the trunk to learn features useful for *both* tasks. A feature like "I have a chain of stones almost connecting my sides" is both evidence that I am likely to win (value) *and* a reason to extend that chain (policy). A few more examples of this dual-purpose signal:
+
+| Trunk feature the network might learn | Why it helps the **value** head | Why it helps the **policy** head |
+|---|---|---|
+| "My chain spans 8 of 11 rows with no gaps" | Strong evidence I'm close to winning → push value toward +1 | The 1–2 cells that close the remaining gap should get high logits |
+| "Opponent has a bridge (two-cell virtual connection)" | Their position is safer than raw stone count suggests → temper value | The bridge's carrier cells become urgent — either defend them or they're low priority to attack elsewhere |
+| "Center of board is contested, edges are empty" | Position is still early/uncertain → value near 0 | Center cells are more valuable in Hex (higher connectivity) → boost their logits |
+| "A single move would complete an unbreakable ladder" | That's close to a forced win → value near +1 | That move should dominate the policy distribution |
+
+Sharing the trunk means each of these signals is computed **once** in the shared convolutional features and then **read out twice** — once through the policy head's 1×1 conv + linear layers, once through the value head's. Without sharing, two separate networks would each have to rediscover "what a near-complete chain looks like" from scratch, using twice the parameters and twice the data to learn the same underlying pattern.
+
+#### Why this tends to generalize better, not just save compute
+
+Beyond efficiency, joint training acts as a form of regularization. The value head's gradient discourages the trunk from encoding features that are good for predicting the *next move* but useless for judging *who's winning* (e.g., superficial move-ordering artifacts from self-play). Conversely, the policy head's gradient discourages the trunk from collapsing onto a single "am I ahead or behind" scalar that discards the spatial detail needed to pick *which* cell to play. Each head acts as a check on the other, nudging the trunk toward genuinely board-relevant spatial features rather than task-specific shortcuts.
+
+#### The one caveat: the two objectives can pull against each other
+
+This isn't free — see the **Overfitting** row in [Section 10](#10-practical-tips). If the policy and value losses disagree about which trunk features to prioritize (negative transfer), one task's loss can plateau while the other keeps improving. That's why the loss is often written as `policy_loss + c * value_loss` with `c` tuned rather than fixed at 1.0 — it lets you rebalance how much of the trunk's capacity each head gets to claim.
+
+### 4.3 From network outputs to an actual move, a concrete example
+
+It's natural to assume the network directly picks the move — e.g. "take the highest policy score." **That's not what this implementation does**, but it's worth walking through why, using the same empty 3×3 board from [Section 5.3](#53-concrete-walkthrough-on-a-33-hex-board).
+
+**If we used the network alone (no search), here's what that would look like:**
+
+1. Feed the empty board through the network. Say it returns these 9 raw `policy_logits` (illustrative numbers) and `value = 0.0` (roughly even, nobody's moved yet):
+   ```
+   raw logits:   1.9   2.1   1.8
+                  2.3   3.4   2.2
+                   1.6   2.5   1.9
+   ```
+2. **Mask illegal moves** — on an empty board nothing is masked, but this is the step that would set occupied cells to `-1e9` on a later move ([mcts.py:783](HEX_IMPLEMENTATION.md#L783)).
+3. **Softmax** the (masked) logits into probabilities. Suppose that produces exactly the priors already shown in 5.3:
+   ```
+   0.08  0.10  0.07
+    0.12  0.25  0.11
+     0.06  0.13  0.08
+   ```
+4. **Turn probabilities into one chosen move** — two options, both used somewhere in this codebase:
+   - **Argmax (greedy):** always take the single highest-probability cell → `(1,1)`, center, P=0.25. This is what `play.py`'s `mcts.search(game); move = visits.argmax()` does at the *end* of search ([play.py](HEX_IMPLEMENTATION.md#L1093)) — except it argmaxes over **visit counts**, not raw policy, for reasons below.
+   - **Sample proportionally:** roll a weighted die over the 9 probabilities. Cell `(1,1)` is most likely but not guaranteed — this is what `self_play_game`'s `np.random.choice(len(flat), p=flat)` does ([self_play.py:888](HEX_IMPLEMENTATION.md#L888)), so training games stay varied instead of replaying the same opening every time.
+
+**Why this codebase never actually stops at step 4.** A single forward pass gives one-ply intuition — "this cell looks good *right now*" — with no lookahead into how the opponent would respond. That's exactly the gap [Section 5](#5-monte-carlo-tree-search) closes: the policy output seeds the **priors** `P(s,a)` on new MCTS nodes ([mcts.py:755](HEX_IMPLEMENTATION.md#L755)), and the value output becomes the **backup signal** whenever search reaches a new leaf ([mcts.py:818](HEX_IMPLEMENTATION.md#L818)) — running hundreds of simulated lines through the tree before ever picking a move. The move that's actually played is the one from [Section 5.4](#54-picking-the-final-move): the root's child with the **most visits after search**, e.g. `(1,1)` with 95 of 200 visits — a number that reflects the network's opinion *plus* everything the tree learned by simulating ahead, not the raw one-shot policy score.
 
 ---
 
@@ -544,6 +651,8 @@ Empty board:         RED wins top→bottom
 ```
 
 The board has 9 empty cells, so the root node will have **9 children** — one for each legal first move.
+
+> **A note on perspective, before we start:** Recall from [4.1](#41-input-and-output-precisely) that the network's raw `value` output is always relative to *whoever is the mover in the exact board state you fed it* — there's no separate "RED value" and "BLUE value," just one number relative to the current input's mover. But the tree below uses a *different* convention for each node's stored `Q`: a node represents *an action that was taken*, so its `Q` is kept relative to **the player who took that action** (the parent's mover), not the player who is now to move at the resulting state. Those two conventions are one negation apart — every time we evaluate a leaf, we take the network's raw mover-relative output and flip its sign once before storing it, then flip again at each ancestor going up. Watch for this flip explicitly in Step B below.
 
 ---
 
@@ -597,10 +706,10 @@ The board after this move:
     .  .  .
 ```
 
-**EXPAND:** Node (1,1) is a leaf, so we run the neural network on this new board state (from BLUE's perspective). The network returns:
+**EXPAND:** Node (1,1) is a leaf, so we run the neural network on this new board state. It's BLUE's turn here, so per [4.1](#41-input-and-output-precisely) the raw output is relative to BLUE (the mover at this state). The network returns:
 
 - **Policy priors** for BLUE's 8 remaining legal moves
-- **Value = −0.15** (meaning BLUE thinks RED is slightly ahead)
+- **Value = −0.15**, in the network's own convention — i.e. relative to BLUE, the mover who is about to act here. Negative means BLUE (the mover) looks slightly worse off, which is the same as saying RED (who just moved into this position) looks slightly better off.
 
 We create 8 child nodes under (1,1):
 
@@ -616,7 +725,7 @@ We create 8 child nodes under (1,1):
                     P=.. P=.. P=..   P=..
 ```
 
-**EVALUATE:** The value network said −0.15 from BLUE's perspective. But node (1,1) belongs to RED. We need to negate: **value = +0.15** from RED's perspective.
+**EVALUATE:** The network gave us −0.15 in *its* convention (relative to BLUE, the mover at this state). But this tree stores each node's `Q` in the *tree's* convention — relative to whoever moved **into** that node, which is RED for node (1,1). Converting between the two conventions is exactly one negation: **value = +0.15**, now relative to RED.
 
 **BACKUP:** Walk back up the path, updating each node and **negating at each step**:
 
@@ -626,7 +735,7 @@ Node (1,1):  N: 0→1,  W: 0→+0.15,  Q = +0.15
 ROOT:        N: 0→1,  W: 0→−0.15,  Q = −0.15
 ```
 
-Why negate at the root? The root is RED's decision point. A value of −0.15 at the root means "after RED plays (1,1), the value to the *next* player to move at root level is −0.15." This bookkeeping ensures every Q value is always from the perspective of the player who *makes* the choice at that node.
+Why negate again at the root? Same rule as before: the root represents "whoever moved into the root," which for the very first move is... nobody yet — but the root's `Q` is used to judge *root's children* via PUCT, and by convention it's kept relative to whoever is to move at the root, i.e. RED. Node (1,1)'s +0.15 was relative to RED already (from the EVALUATE step), so why flip it again going into ROOT? Because moving from child → parent always crosses one ply, i.e. one change of mover — the tree negates unconditionally at every edge on the backup path, regardless of whose convention lines up with whose. The result, −0.15 at ROOT, is best read operationally rather than by whose name is attached to it: it's the number the *root's parent* would use — which doesn't exist here, so in practice the root's own `Q` is never consulted directly. What matters for move selection is the **children's** `Q` (like node (1,1)'s +0.15), which is exactly the convention PUCT relies on when it picks the best action at the root.
 
 ---
 
@@ -655,7 +764,7 @@ Suppose we descend into (1,1) again. Now we must choose among its 8 children (BL
 #### After many simulations the tree looks like this:
 
 ```
-                          ROOT  (N=200)
+                          ROOT  (N=240)
                  ╱    ╱    │    ╲    ╲
               (0,0) (0,1) (1,1) (1,2) (2,1)  ...
               N=8   N=12  N=95  N=35  N=28   ...
@@ -832,9 +941,7 @@ class MCTS:
         return visits
 ```
 
-### Why negate the value at each backup step?
-
-At every edge in the tree, the active player switches. A position that is worth +0.8 to me is worth −0.8 to my opponent. Negating as we propagate upwards keeps the Q-values always relative to "the player whose turn it is at that node" — this is the **negamax** convention.
+> **Recap:** `value = -value` on the way up (line `value = -value` in the loop above) is the same negamax flip walked through in detail in [5.3](#53-concrete-walkthrough-on-a-33-hex-board) — every edge in the tree crosses one ply, so every edge flips whose perspective the accumulated `Q` is relative to.
 
 ---
 
@@ -921,7 +1028,7 @@ def generate_dataset(net, num_games=100, board_size=11,
 
 ---
 
-## 7. Training Loop
+## 7. Training
 
 The loss has two components:
 - **Policy loss:** cross-entropy between the MCTS visit distribution and the network's policy output.
@@ -1047,6 +1154,31 @@ if __name__ == "__main__":
         num_simulations= 50,
     )
 ```
+
+### 7.1 A worked example: one training step
+
+Let's take one concrete self-play record and run it all the way from "where did this target come from" through to "what does the gradient actually do." Reuse the empty 3×3 board from [4.3](#43-from-network-outputs-to-an-actual-move-a-concrete-example) and [5.3](#53-concrete-walkthrough-on-a-33-hex-board), RED to move.
+
+**Where `target_policies` and `target_values` came from (Section 6).** This record was produced by `self_play_game`. Its `state` is `encode()` of the empty board. Its `target_policies` (`π_mcts`) is *not* the network's raw prior — it's the normalized visit-count distribution MCTS actually settled on after searching, from Section 5.4's numbers:
+
+```
+visit counts:      normalized (π_mcts):
+  8   12   7          0.033  0.050  0.029
+   28  95  35    →      0.117  0.396  0.146
+    15  28  12           0.063  0.117  0.050
+```
+
+Its `target_values` (`z`) is `+1.0`, because — per the outcome-assignment rule at [self_play.py:1002](HEX_IMPLEMENTATION.md#L1002) — suppose RED (the mover at this state) went on to win this particular game.
+
+**The forward pass (`train_epoch`).** Before this gradient step, this is the *same* network whose priors seeded MCTS's root in [4.3](#43-from-network-outputs-to-an-actual-move-a-concrete-example): `policy_logits`, after softmax, currently gives `π_net` = 0.08, 0.10, 0.07 / 0.12, 0.25, 0.11 / 0.06, 0.13, 0.08. Say `value_pred = 0.05` — the network currently thinks this position is close to even.
+
+**Policy loss.** `log_probs = F.log_softmax(policy_logits, dim=1)` is just `log(π_net)`, cell by cell. `policy_loss = -(target_policies * log_probs).sum(dim=1).mean()` sums `π_mcts × -log(π_net)` over all 9 cells ≈ **1.94**. The single biggest contributor is cell `(1,1)`: `0.396 × -log(0.25) ≈ 0.55`, over a quarter of the total — because that's exactly the cell where search ended up far more confident (0.396) than the network's own prior (0.25).
+
+**Value loss.** `value_loss = F.mse_loss(value_pred, target_values)` = `(1.0 − 0.05)² ≈ 0.90` — the network under-rated this position; the actual game outcome says it was much better for RED than the network's own estimate.
+
+**Backward pass.** `loss = policy_loss + value_loss ≈ 2.84`. `loss.backward()` computes `∂loss/∂θ` for every weight via the chain rule: `policy_conv`/`policy_fc` receive gradient from `policy_loss` only, `value_conv`/`value_fc1`/`value_fc2` receive gradient from `value_loss` only, and the shared `stem`/`tower` accumulate gradient from **both** — exactly the mechanism described in [Section 4's "two loss terms, one set of trunk weights"](#the-mechanical-reason-two-loss-terms-one-set-of-trunk-weights). `optimizer.step()` then nudges every weight a small step opposite its own gradient.
+
+**What actually moves, and why it matters.** Since `π_mcts[(1,1)] = 0.396` is bigger than `π_net[(1,1)] = 0.25`, cross-entropy's gradient pushes the logit for `(1,1)` up (and, because softmax normalizes, the others slightly down) — search found that move more convincing than the raw network did, so this step pulls the network's prior toward what search discovered. Since `z = 1.0` is bigger than `value_pred = 0.05`, MSE's gradient pushes the value estimate for this state upward — the real game outcome says the network was too pessimistic. This is the core AlphaGo mechanism: **the network is trained to imitate its own search results.** Search is consistently a little stronger than the raw network alone, because it looks ahead; every training step closes a bit of that gap, which is exactly why the *next* iteration's self-play games ([Section 6](#6-self-play-data-generation)) start from an improved prior and a better value estimate.
 
 ---
 
