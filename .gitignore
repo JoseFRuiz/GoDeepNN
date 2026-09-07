@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Trained model checkpoints (can get large fast)
+*.pt
+*.pth
+*.ckpt
+hex_net_iter*.pt
+
+# Self-play / training data dumps
+/data/
+/datasets/
+*.npz
+*.npy
+*.pkl
+
+# OS
+.DS_Store
+Thumbs.db

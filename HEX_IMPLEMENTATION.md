@@ -1026,9 +1026,148 @@ def generate_dataset(net, num_games=100, board_size=11,
     return dataset
 ```
 
+### 6.1 Step-by-step: one full self-play game on a 3×3 board
+
+Let's trace `self_play_game` end to end on `board_size=3`, `temperature=1.0`, playing out the exact same 5-move game already traced for win-detection in [3.3](#33-win-detection-with-union-find) — RED plays `(0,1) → (1,1) → (2,0)`, BLUE plays `(0,0) → (1,0)`, RED wins.
+
+---
+
+**Move 1 (i=0). Board is empty, RED to move.**
+
+```
+  .  .  .
+   .  .  .
+    .  .  .
+```
+
+`state = game.encode()` — nothing's been played, so both channels are all zeros.
+
+`visits = mcts.search(game)` runs 200 simulations and returns a visit-count grid (see [Section 5](#5-monte-carlo-tree-search) for how). Suppose it comes back as:
+
+```
+visit counts:        π_mcts (visits / 200, temperature=1 so unchanged):
+  7   47   10          0.035  0.235  0.050
+  13   73   17    →      0.065  0.365  0.085
+   10   13   10           0.050  0.065  0.050
+```
+
+Center `(1,1)` is still the network's favorite (36.5%), same as in [5.3](#53-concrete-walkthrough-on-a-33-hex-board) — but this time, sampling from this distribution happens to draw `(0,1)` (23.5% chance, not the mode). This is exactly why `temperature=1.0` matters early in the game: **different self-play games explore different lines**, even from the identical opening position and the identical network.
+
+`records.append((state, visits_t))` → `records[0] = (state0, π_mcts0)`. `game.make_move(0, 1)`.
+
+---
+
+**Move 2 (i=1). Board has R at (0,1), BLUE to move.**
+
+```
+  .  R  .
+   .  .  .
+    .  .  .
+```
+
+`state = game.encode()` — now channel 0 = BLUE's stones (none yet, all zero) and channel 1 = RED's stones (a single 1 at `(0,1)`). **This is the perspective flip from [4.1](#41-input-and-output-precisely) in action**: that same RED stone at `(0,1)` was invisible before (nothing had been played), and after RED's own next move it will show up in *channel 0* instead of channel 1, because "channel 0" always means "whoever's turn it is," not "RED."
+
+Search returns (illustrative numbers):
+
+```
+visit counts:         π_mcts (visits / 200):
+ 45    ·   20          0.225   ·   0.100
+  35   50   15    →      0.175  0.250  0.075
+   10   15   10           0.050  0.075  0.050
+```
+
+(`(0,1)` is occupied, so it's masked — no prior, no visits, shown as `·`.) Sampling draws `(0,0)`, 22.5% likely. `records[1] = (state1, π_mcts1)`. `game.make_move(0, 0)`.
+
+---
+
+**Moves 3–5.** The same three-step cycle — `encode()` → `mcts.search()` (fresh 200 simulations from the new position) → sample from `visits_t` — repeats for each remaining ply. To keep this walkthrough short, we won't redraw the visit grids again; just the boards and the moves this particular game happened to sample, continuing the trajectory from [3.3](#33-win-detection-with-union-find):
+
+```
+Move 3 (i=2), RED to move        Move 4 (i=3), BLUE to move       Move 5 (i=4), RED to move
+  B  R  .                          B  R  .                          B  R  .
+   .  .  .        → RED (1,1) →     B  R  .       → BLUE (1,0) →      B  R  .      → RED (2,0) →  RED wins
+    .  .  .                          .  .  .                           R  .  .
+```
+
+After move 5, `self._uf.connected(RED_TOP, RED_BOTTOM)` is `True` ([3.4, step 5](#34-make_move-line-by-line)), so `game.is_terminal()` becomes `True` and the `while` loop in `self_play_game` exits with `records` holding **5 entries**, `records[0]` through `records[4]`.
+
+---
+
+**Assigning outcomes.** `game.winner = RED`. The loop at [self_play.py:1002](HEX_IMPLEMENTATION.md#L1002) walks every record and compares its mover to the winner:
+
+```
+i   mover (RED if i even, else BLUE)   mover == winner?   outcome
+0   RED                                 yes                +1.0
+1   BLUE                                no                 -1.0
+2   RED                                 yes                +1.0
+3   BLUE                                no                 -1.0
+4   RED                                 yes                +1.0
+```
+
+Note this isn't "RED always gets +1" as a rule about color — it's "the mover of *this specific record* gets +1 if *that mover* turned out to be the winner." In a game BLUE won, the parity would be reversed: BLUE's records would get +1 and RED's −1.
+
+**The return value.** `self_play_game` returns:
+
+```
+examples = [
+  (state0, π_mcts0, +1.0),   # RED, move (0,1)
+  (state1, π_mcts1, -1.0),   # BLUE, move (0,0)
+  (state2, π_mcts2, +1.0),   # RED, move (1,1)
+  (state3, π_mcts3, -1.0),   # BLUE, move (1,0)
+  (state4, π_mcts4, +1.0),   # RED, move (2,0)
+]
+```
+
+`generate_dataset` calls `self_play_game` `games_per_iter` times and concatenates all of their `examples` lists into one flat `dataset` — that's the list `HexDataset` wraps in [Section 7](#7-training), and each entry is exactly the shape of record that [7.2](#72-a-worked-example-one-training-step) walks through the loss and backward pass.
+
 ---
 
 ## 7. Training
+
+### 7.1 How self-play and training fit together
+
+Section 6 produces data; this section consumes it. Concretely, `training_pipeline` ([train.py:1133](HEX_IMPLEMENTATION.md#L1133)) alternates between the two, over and over, and each iteration's self-play uses whatever the network just learned in the iteration before.
+
+**Before the full diagram, the one fact to hold onto:** no matter where it's called from, `HexNet.forward()` always takes **the current board state** as input and always returns the same two things — **a policy** (which cell looks best to play *right now*) and **a value** (who's likely to win *from here*). The two call sites below only differ in what they *do* with that policy and value afterward:
+
+```
+ ┌──▶  current network (net)
+ │            │
+ │            ▼
+ │   Self-Play — generate_dataset() / self_play_game()          (Section 6)
+ │   games_per_iter games; every move chosen by running MCTS,
+ │   which calls the net once per simulation ("MCTS._evaluate"):
+ │
+ │       IN  →  current board state, shape (1, 2, N, N)
+ │              "my stones (ch.0) vs. opponent's stones (ch.1)" — 4.1
+ │       OUT →  POLICY: policy_logits (1, N²)   ──▶  softmax + mask  ──▶  MCTS priors P(s,a)
+ │              VALUE:  value (1, 1) ∈ [-1,+1]  ──▶  negated on backup ──▶  leaf value for Q
+ │            │
+ │            │  examples: list of (state, π_mcts, z)
+ │            │  π_mcts = visit-count distribution AFTER search, not the raw policy above
+ │            ▼
+ │   HexDataset + DataLoader                                      (Section 7)
+ │   wraps the examples into batches
+ │            │
+ │            ▼
+ │   train_epoch(), run epochs_per_iter times                     (Section 7)
+ │
+ │       IN  →  a batch of board states, shape (batch, 2, N, N)
+ │       OUT →  POLICY: policy_logits (batch, N²)  ──▶  vs. target_policies (π_mcts)  ──▶  policy_loss
+ │              VALUE:  value_pred (batch, 1)      ──▶  vs. target_values (z)         ──▶  value_loss
+ │
+ │   loss = policy_loss + value_loss  →  loss.backward()  →  optimizer.step()
+ │            │
+ │            ▼
+ │   updated network (net)  +  checkpoint saved to hex_net_iterNNN.pt
+ │            │
+ └────────────┘   loop back as "current network" for the next iteration
+                    (repeated num_iterations times)
+```
+
+Notice the network's *input and output shape* never change — always **the current board state** in, always **one policy + one value** out — but the *meaning* of that output does: during self-play it's read as search guidance (a prior to explore first, a leaf estimate to back up), and during training it's graded against exactly the numbers that search and the game's outcome actually produced. (The network never receives a *sequence* of past states or a plan — every single call is a fresh look at one board, right now.)
+
+So "the network" is never a fixed, finished thing while training runs — it's simultaneously the *player* that generates this iteration's self-play games and the *student* being updated by last iteration's games. That feedback loop (better network → better self-play data → better network) is the entire mechanism behind the improvement AlphaGo-style training relies on; a single pass through the loop is what [7.2](#72-a-worked-example-one-training-step) below walks through with real numbers.
 
 The loss has two components:
 - **Policy loss:** cross-entropy between the MCTS visit distribution and the network's policy output.
@@ -1155,7 +1294,7 @@ if __name__ == "__main__":
     )
 ```
 
-### 7.1 A worked example: one training step
+### 7.2 A worked example: one training step
 
 Let's take one concrete self-play record and run it all the way from "where did this target come from" through to "what does the gradient actually do." Reuse the empty 3×3 board from [4.3](#43-from-network-outputs-to-an-actual-move-a-concrete-example) and [5.3](#53-concrete-walkthrough-on-a-33-hex-board), RED to move.
 
